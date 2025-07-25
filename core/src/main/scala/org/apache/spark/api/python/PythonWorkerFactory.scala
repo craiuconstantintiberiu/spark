@@ -34,7 +34,7 @@ import org.apache.spark._
 import org.apache.spark.errors.SparkCoreErrors
 import org.apache.spark.internal.{Logging, MDC}
 import org.apache.spark.internal.LogKeys._
-import org.apache.spark.internal.config.Python.{PYTHON_UNIX_DOMAIN_SOCKET_DIR, PYTHON_UNIX_DOMAIN_SOCKET_ENABLED}
+import org.apache.spark.internal.config.Python.{PYTHON_UNIX_DOMAIN_SOCKET_DIR, PYTHON_UNIX_DOMAIN_SOCKET_ENABLED, PYTHON_FACTORY_IDLE_WORKER_MAX_POOL_SIZE}
 import org.apache.spark.security.SocketAuthHelper
 import org.apache.spark.util.{RedirectThread, Utils}
 
@@ -111,7 +111,9 @@ private[spark] class PythonWorkerFactory(
   @GuardedBy("self")
   private var daemonSockPath: String = _
   @GuardedBy("self")
-  private val idleWorkers = new mutable.Queue[PythonWorker]()
+  private val idleWorkers = new mutable.LinkedHashSet[PythonWorker]()
+  @GuardedBy("self")
+  private val idleWorkerPoolSize = authHelper.conf.get(PYTHON_FACTORY_IDLE_WORKER_MAX_POOL_SIZE)
   @GuardedBy("self")
   private var lastActivityNs = 0L
   new MonitorThread().start()
@@ -127,9 +129,10 @@ private[spark] class PythonWorkerFactory(
   def create(): (PythonWorker, Option[ProcessHandle]) = {
     if (useDaemon) {
       self.synchronized {
-        // Pull from idle workers until we one that is alive, otherwise create a new one.
+        // Pull from idle workers until we get one that is alive, otherwise create a new one.
         while (idleWorkers.nonEmpty) {
-          val worker = idleWorkers.dequeue()
+          val worker = idleWorkers.iterator.next()
+          idleWorkers.remove(worker)
           daemonWorkers.get(worker).foreach { workerHandle =>
             if (workerHandle.isAlive()) {
               try {
@@ -140,10 +143,10 @@ private[spark] class PythonWorkerFactory(
             }
           }
           logWarning(log"Worker ${MDC(WORKER, worker)} " +
-            log"process from idle queue is dead, discarding.")
+            log"process from idle cache is dead, discarding.")
           stopWorker(worker)
-        }
-      }
+       }
+    }
       createThroughDaemon()
     } else {
       createSimpleWorker(blockingMode = false)
@@ -426,8 +429,7 @@ private[spark] class PythonWorkerFactory(
   }
 
   private def cleanupIdleWorkers(): Unit = {
-    while (idleWorkers.nonEmpty) {
-      val worker = idleWorkers.dequeue()
+    idleWorkers.foreach { worker =>
       try {
         worker.stop()
       } catch {
@@ -435,6 +437,7 @@ private[spark] class PythonWorkerFactory(
           logWarning("Failed to stop worker socket", e)
       }
     }
+    idleWorkers.clear()
   }
 
   private def stopDaemon(): Unit = {
@@ -483,7 +486,17 @@ private[spark] class PythonWorkerFactory(
     if (useDaemon) {
       self.synchronized {
         lastActivityNs = System.nanoTime()
-        idleWorkers.enqueue(worker)
+        idleWorkers.add(worker)
+        if (idleWorkerPoolSize.exists(idleWorkers.size > _)) {
+          val oldestWorker = idleWorkers.iterator.next()
+          idleWorkers.remove(oldestWorker)
+          try {
+            oldestWorker.stop()
+          } catch {
+            case e: Exception =>
+              logWarning("Failed to stop evicted worker", e)
+          }
+        }
       }
     } else {
       try {
